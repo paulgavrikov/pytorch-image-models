@@ -339,6 +339,8 @@ group.add_argument('--use-multi-epochs-loader', action='store_true', default=Fal
 group.add_argument('--log-wandb', action='store_true', default=False,
                     help='log training and validation metrics to wandb')
 
+group.add_argument('--freeze_spatial_convs', action='store_true', default=False)
+
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -425,6 +427,12 @@ def main():
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint,
     )
+    
+    if args.freeze_spatial_convs:
+        for module in filter(lambda m: type(m) == torch.nn.Conv2d and m.kernel_size[0] > 1, model.modules()):
+            for p in module.parameters():
+                p.requires_grad = False
+    
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
