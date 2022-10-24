@@ -331,32 +331,47 @@ def create_aa(aa_layer, channels, stride=2, enable=True):
     return aa_layer(stride) if issubclass(aa_layer, nn.AvgPool2d) else aa_layer(channels=channels, stride=stride)
 
 
+def make_conv(f_in: int, f_out: int, kernel_size: int, stride: int, padding: int, dilation: int, bias: bool= False, depthwise: bool=False):
+    if not depthwise:
+        return nn.Conv2d(f_in, f_out, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, bias=bias)
+    else:
+        return nn.Sequential(
+            nn.Conv2d(f_in, f_in, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, bias=bias, groups=f_in),
+            nn.BatchNorm2d(f_in),
+            nn.Conv2d(f_in, f_out, kernel_size=1, bias=bias),
+        )
+
+
 class BasicBlock(nn.Module):
     expansion = 1
 
     def __init__(
             self, inplanes, planes, stride=1, downsample=None, cardinality=1, base_width=64,
             reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
-            attn_layer=None, aa_layer=None, drop_block=None, drop_path=None):
+            attn_layer=None, aa_layer=None, drop_block=None, drop_path=None, depthwise=False):
         super(BasicBlock, self).__init__()
 
         assert cardinality == 1, 'BasicBlock only supports cardinality of 1'
-        assert base_width == 64, 'BasicBlock does not support changing base width'
+        # assert base_width == 64, 'BasicBlock does not support changing base width'
         first_planes = planes // reduce_first
         outplanes = planes * self.expansion
         first_dilation = first_dilation or dilation
         use_aa = aa_layer is not None and (stride == 2 or first_dilation != dilation)
 
-        self.conv1 = nn.Conv2d(
-            inplanes, first_planes, kernel_size=3, stride=1 if use_aa else stride, padding=first_dilation,
-            dilation=first_dilation, bias=False)
+        #self.conv1 = nn.Conv2d(
+        #    inplanes, first_planes, kernel_size=3, stride=1 if use_aa else stride, padding=first_dilation,
+        #    dilation=first_dilation, bias=False)
+        self.conv1 = make_conv(inplanes, first_planes, kernel_size=3, stride=1 if use_aa else stride, 
+                               padding=first_dilation, dilation=first_dilation, bias=False, depthwise=depthwise)
         self.bn1 = norm_layer(first_planes)
         self.drop_block = drop_block() if drop_block is not None else nn.Identity()
         self.act1 = act_layer(inplace=True)
         self.aa = create_aa(aa_layer, channels=first_planes, stride=stride, enable=use_aa)
 
-        self.conv2 = nn.Conv2d(
-            first_planes, outplanes, kernel_size=3, padding=dilation, dilation=dilation, bias=False)
+        #self.conv2 = nn.Conv2d(
+        #    first_planes, outplanes, kernel_size=3, padding=dilation, dilation=dilation, bias=False)
+        self.conv2 = make_conv(first_planes, outplanes, kernel_size=3, padding=dilation, dilation=dilation, 
+                               stride=1, bias=False, depthwise=depthwise)
         self.bn2 = norm_layer(outplanes)
 
         self.se = create_attn(attn_layer, outplanes)
@@ -463,6 +478,59 @@ class Bottleneck(nn.Module):
             shortcut = self.downsample(shortcut)
         x += shortcut
         x = self.act3(x)
+
+        return x
+    
+    
+class Bottleneck2(nn.Module):
+    expansion = 4
+
+    def __init__(
+            self, inplanes, planes, stride=1, downsample=None, cardinality=1, base_width=64,
+            reduce_first=1, dilation=1, first_dilation=None, act_layer=nn.ReLU, norm_layer=nn.BatchNorm2d,
+            attn_layer=None, aa_layer=None, drop_block=None, drop_path=None):
+        super(Bottleneck2, self).__init__()
+
+        width = int(math.floor(planes * (base_width / 64)) * cardinality)
+        first_planes = width // reduce_first
+        outplanes = planes * self.expansion
+        first_dilation = first_dilation or dilation
+        use_aa = aa_layer is not None and (stride == 2 or first_dilation != dilation)
+
+        self.conv1 = nn.Conv2d(inplanes, inplanes, kernel_size=3, stride=1 if use_aa else stride,
+            padding=first_dilation, dilation=first_dilation, groups=inplanes, bias=False)
+        self.bn1 = norm_layer(inplanes)
+        self.act1 = act_layer(inplace=True)
+
+        self.conv2 = nn.Conv2d(inplanes, outplanes, kernel_size=1, bias=False)
+        self.bn2 = norm_layer(outplanes)
+        self.act2 = act_layer(inplace=True)
+        
+        self.downsample = downsample
+        self.stride = stride
+        self.dilation = dilation
+        self.drop_path = drop_path
+
+    def zero_init_last(self):
+        nn.init.zeros_(self.bn2.weight)
+
+    def forward(self, x):
+        shortcut = x
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.act1(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+
+        if self.drop_path is not None:
+            x = self.drop_path(x)
+
+        if self.downsample is not None:
+            shortcut = self.downsample(shortcut)
+        x += shortcut
+        x = self.act2(x)
 
         return x
 
@@ -670,7 +738,7 @@ class ResNet(nn.Module):
         self.feature_info.extend(stage_feature_info)
 
         # Head (Pooling and Classifier)
-        self.num_features = 512 * block.expansion
+        self.num_features = channels[-1] * block.expansion
         self.global_pool, self.fc = create_classifier(self.num_features, self.num_classes, pool_type=global_pool)
 
         self.init_weights(zero_init_last=zero_init_last)
@@ -1606,3 +1674,39 @@ def resnetrs420(pretrained=False, **kwargs):
         block=Bottleneck, layers=[4, 44, 87, 4], stem_width=32, stem_type='deep', replace_stem_pool=True,
         avg_down=True,  block_args=dict(attn_layer=attn_layer), **kwargs)
     return _create_resnet('resnetrs420', pretrained, **model_args)
+
+
+@register_model
+def resned18d(pretrained=False, **kwargs):
+    """Constructs a ResNeD-18 model.
+    """
+    model_args = dict(block=BasicBlock, layers=[2, 2, 2, 2], block_args={"depthwise": True}, stem_width=44, stem_type='deep', avg_down=True, **kwargs)
+    return _create_resnet('resned18d', pretrained, **model_args)
+
+
+@register_model
+def resned34d(pretrained=False, **kwargs):
+    """Constructs a ResNeD-34 model.
+    """
+    model_args = dict(block=BasicBlock, layers=[3, 4, 6, 3], block_args={"depthwise": True}, stem_width=32, stem_type='deep', avg_down=True, **kwargs)
+    return _create_resnet('resned34d', pretrained, **model_args)
+
+@register_model
+def resned50d(pretrained=False, **kwargs):
+    """Constructs a ResNeD-50 model.
+    """
+    model_args = dict(block=Bottleneck, layers=[3, 4, 6, 3], block_args={"depthwise": True}, stem_width=32, stem_type='deep', avg_down=True, **kwargs)
+    return _create_resnet('resned50d', pretrained, **model_args)
+
+
+@register_model
+def resned101d(pretrained=False, **kwargs):
+    """Constructs a ResNeD-101 model.
+    """
+    model_args = dict(block=Bottleneck, layers=[3, 4, 23, 3], block_args={"depthwise": True}, stem_width=32, stem_type='deep', avg_down=True, **kwargs)
+    return _create_resnet('resned101d', pretrained, **model_args)
+
+@register_model
+def resned50_bottleneck2(pretrained=False, **kwargs):
+    model_args = dict(block=Bottleneck2, layers=[3, 4, 6, 3],  **kwargs)
+    return _create_resnet('resned50_bottleneck2', pretrained, **model_args)
